@@ -1,0 +1,167 @@
+# ---------------------------
+# 0. Load Required Libraries
+# ---------------------------
+
+# Install if needed 
+packages <- c(
+  "BiocManager", "devtools", "curl", "ggplot2", "FactoMineR", "factoextra", "plotly",
+  "reshape2", "viridis", "UpSetR", "PCAtools", "opentimsr", "tidyverse",
+  "impute", "missForest", "pheatmap", "nortest", "naniar", "limma"
+)
+
+install_if_missing <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+lapply(packages, install_if_missing)
+if (!requireNamespace("Biobase", quietly = TRUE)) BiocManager::install("Biobase")
+devtools::install_github("cox-labs/PerseusR")
+
+# Load libraries
+library(tidyverse)
+library(impute)
+library(ggplot2)
+library(pheatmap)
+library(FactoMineR)
+library(factoextra)
+library(dplyr)
+library(stringr)
+library(reshape2)
+library(missForest)
+library(nortest)
+library(naniar)
+library(limma)
+
+# ---------------------------
+# 1. Data Import & Cleaning
+# ---------------------------
+
+data <- read.delim("your/path/pg_matrix.tsv", row.names = 1)
+colnames(data) <- str_extract(colnames(data), "^[^_]+")
+
+# ---------------------------
+# 2. Filtering & Log2 Normalization
+# ---------------------------
+
+# Filter samples with <80% of median protein counts
+protein_counts <- colSums(!is.na(data))
+threshold <- 0.8 * median(protein_counts)
+data_filtered <- data[, protein_counts >= threshold]
+
+# Keep only numeric columns
+data_numeric <- data_filtered %>% select(where(is.numeric))
+data_log2 <- log2(data_numeric)
+
+# ---------------------------
+# 3. Missing Data Assessment
+# ---------------------------
+
+data_log2$Protein <- rownames(data_log2)
+data_long <- melt(data_log2, id.vars = "Protein", variable.name = "Sample", value.name = "Log2_Value")
+
+# Histograms & Q-Q Plot
+ggplot(data_long, aes(x = Log2_Value)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Histogram of Log2-Transformed Data", x = "Log2 Value", y = "Frequency") +
+  theme_minimal()
+
+qqnorm(data_long$Log2_Value)
+qqline(data_long$Log2_Value, col = "red")
+
+# Missingness visualizations
+gg_miss_var(data_long, facet = Sample) +
+  theme(axis.text.x = element_text(angle = 90))
+vis_miss(data_long)
+
+# ---------------------------
+# 4. Imputation
+# ---------------------------
+
+# Optional: at this point it might be useful to check missing data pattern with naniar package to determine if more targeted imputation method may be beneficial
+
+protein_ids <- rownames(data_log2)
+data_matrix <- data_log2 %>% select(-Protein) %>% as.matrix()
+data_imputed <- impute.knn(data_matrix)$data
+rownames(data_imputed) <- protein_ids
+
+# ---------------------------
+# 5. PCA & Clustering
+# ---------------------------
+
+# Optional: consider assess for potential batch effects if using multiple batches
+
+
+pca_result <- prcomp(t(data_imputed), scale. = TRUE)
+pca_data <- as.data.frame(pca_result$x)
+
+# PCA plot
+ggplot(pca_data, aes(x = PC1, y = PC2, label = rownames(pca_data))) +
+  geom_point(color = "steelblue") +
+  geom_text(vjust = -1.5, size = 3) +
+  labs(title = "PCA Plot", x = "PC1", y = "PC2") +
+  theme_minimal()
+
+# K-means clustering
+fviz_nbclust(pca_data[, 1:2], kmeans, method = "wss")
+set.seed(42)
+kmeans_result <- kmeans(pca_data[, 1:2], centers = 2)
+pca_data$Cluster <- factor(kmeans_result$cluster)
+
+# PCA + cluster
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = rownames(pca_data)), vjust = -1, size = 3) +
+  labs(title = "PCA with K-means Clustering") +
+  theme_minimal()
+
+# ---------------------------
+# 6. Heatmap
+# ---------------------------
+
+data_zscore <- t(scale(t(data_imputed)))
+
+pheatmap(
+  data_zscore,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_rownames = FALSE,
+  show_colnames = TRUE,
+  scale = "none",
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  main = "Z-Score Heatmap"
+)
+
+# ---------------------------
+# 7. Differential Expression (limma)
+# ---------------------------
+
+metadata <- data.frame(Sample = colnames(data_imputed), Cluster = pca_data$Cluster)
+group <- factor(metadata$Cluster, labels = c("Cluster1", "Cluster2"))
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+contrast <- makeContrasts(Cluster2 - Cluster1, levels = design)
+
+fit <- lmFit(data_imputed, design)
+fit2 <- eBayes(contrasts.fit(fit, contrast))
+limma_results <- topTable(fit2, number = Inf, adjust = "BH")
+
+# Add significance
+limma_results$Significant <- limma_results$adj.P.Val < 0.01 & abs(limma_results$logFC) > log2(1.5)
+
+# Volcano plot
+ggplot(limma_results, aes(x = logFC, y = -log10(adj.P.Val), color = Significant)) +
+  geom_point(alpha = 0.6) +
+  scale_color_manual(values = c("grey", "red")) +
+  labs(
+    title = "Volcano Plot of Differential Expression",
+    x = "Log2 Fold Change",
+    y = "-Log10 Adjusted P-Value"
+  ) +
+  geom_vline(xintercept = c(-log2(1.5), log2(1.5)), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  theme_minimal()
+
+# Print top significant proteins
+head(limma_results[limma_results$Significant, ])
